@@ -1,94 +1,150 @@
 const { Kafka } = require('kafkajs');
+const { HIGH_PRIORITY_TOPIC, LOW_PRIORITY_TOPIC, RESUME_TIMEOUT, RENEW_TIMEOUT } = require('./config');
+const logger = require('./utils/logger');
+const { delay } = require('./utils/delay');
 
-const kafka = new Kafka({
-  clientId: 'priority-example',
-  brokers: ['localhost:9092'],
-});
+class Reader {
+  constructor(topics, processMessage) {
+    const kafka = new Kafka({
+      clientId: 'priority-example',
+      brokers: ['localhost:9092'],
+      logCreator: logger,
+    });
 
-const consumer = kafka.consumer({ groupId: 'group1' });
+    this._consumer = kafka.consumer({ groupId: 'group1' });
+    this._topics = topics;
+    this._resumeTimeout = null;
+    this._processMessage = processMessage;
+    this._batchCounter = 0;
 
-const HIGH_PRIORITY_TOPIC = 'high-priority';
-const LOW_PRIORITY_TOPIC = 'low-priority';
+    this._registerProcessHandlers();
+  }
 
-const topics = [HIGH_PRIORITY_TOPIC, LOW_PRIORITY_TOPIC];
-let resumeTimeout;
+  _registerProcessHandlers() {
+    const stopSignals = ['SIGTERM', 'SIGINT', 'SIGHUP'];
 
-async function init() {
-  await consumer.connect();
+    stopSignals.forEach((signal) => process.on(signal, this._shutdown.bind(this)));
 
-  const promises = topics.map((topic) => consumer.subscribe({ topic }));
-  await Promise.all(promises);
+    process.on('uncaughtException', (err) => {
+      this._consumer.disconnect();
+      console.error('uncaughtException caught the error: %o ', err);
+      process.exit(1);
+    });
+  }
 
-  const processMessage = ({ key, offset, value }, topic) => {
-    console.log(
-      `[${new Date().toISOString()}] 💬 New Message - topic: ${topic}, key: ${key}, offset: ${offset}, value: ${value.toString()}\n`
-    );
-  };
+  async _shutdown() {
+    this._consumer.logger().info('Gracefully Shutting Down 😴...\n');
+    await this._consumer.disconnect();
+    process.exit(0);
+  }
 
-  const pauseTopic = (topic) => {
-    console.log(`🖐️ Pausing Topic: ${topic}`);
-    consumer.pause([{ topic }]);
-  };
+  async start() {
+    await this._connectConsumer();
+    await this._subscribeToTopics();
+    await this._runConsumer();
 
-  const setResumeTopicTimeout = (topic, timeout) => {
-    console.log(`👉 Will Resume Topic: ${topic} in ${timeout}ms`);
+    this._consumer.logger().info('Consumer Started! 🚀\n');
+  }
 
-    clearTimeout(resumeTimeout);
-    resumeTimeout = setTimeout(() => {
-      console.log(`👍 Resuming Topic: ${topic}`);
-      consumer.resume([{ topic }]);
+  async _connectConsumer() {
+    try {
+      await this._consumer.connect();
+    } catch (error) {
+      this._consumer.logger().error(`Erro conectando consumer: ${error.message}`);
+      process.exit(1);
+    }
+  }
+
+  async _subscribeToTopics() {
+    for (const topic of this._topics) {
+      await this._consumer.subscribe({ topic });
+    }
+  }
+
+  async _runConsumer() {
+    await this._consumer.run({
+      autoCommit: false,
+      eachBatch: this._processEachBatch.bind(this),
+    });
+  }
+
+  async _processEachBatch(payload) {
+    await delay(500);
+    const { batch, isRunning, isStale, resolveOffset, heartbeat } = payload;
+    const { topic, partition } = batch;
+
+    this._pauseLowPriorityTopicIfNecessary(topic);
+
+    for (const message of batch.messages) {
+      if (!isRunning() || isStale()) break;
+      await this._handleEachMessage(topic, partition, message, resolveOffset, heartbeat);
+    }
+    this._batchCounter++;
+  }
+
+  async _handleEachMessage(topic, partition, message, resolveOffset, heartbeat) {
+    await this._processMessage(this._batchCounter, topic, message);
+    resolveOffset(message.offset);
+
+    const offset = {
+      topic,
+      partition,
+      offset: (Number(message.offset) + 1).toString(),
+    };
+
+    await this._consumer.commitOffsets([offset]);
+    await heartbeat();
+  }
+
+  _pauseLowPriorityTopicIfNecessary(topic) {
+    if (topic === HIGH_PRIORITY_TOPIC) {
+      if (!this._isPaused(LOW_PRIORITY_TOPIC)) {
+        this._pauseTopic(LOW_PRIORITY_TOPIC);
+        this._setResumeTopicTimeout(LOW_PRIORITY_TOPIC, RESUME_TIMEOUT);
+      } else if (RENEW_TIMEOUT) {
+        this._setResumeTopicTimeout(LOW_PRIORITY_TOPIC, RESUME_TIMEOUT);
+      }
+    }
+  }
+
+  _isPaused(topic) {
+    return Boolean(this._consumer.paused().find(({ topic: _topic }) => _topic === topic));
+  }
+
+  _pauseTopic(topic) {
+    this._consumer.logger().warn(`🖐️ Pausing Topic: ${topic}`);
+    this._consumer.pause([{ topic }]);
+  }
+
+  _setResumeTopicTimeout = (topic, timeout) => {
+    if (this._resumeTimeout && RENEW_TIMEOUT) {
+      clearTimeout(this._resumeTimeout);
+      this._consumer.logger().warn(`👉 [RENEWED] Will Resume Topic: ${topic} in ${timeout}ms`);
+    } else {
+      this._consumer.logger().warn(`👉 Will Resume Topic: ${topic} in ${timeout}ms`);
+    }
+
+    this._resumeTimeout = setTimeout(() => {
+      this._consumer.logger().warn(`👍 Resuming Topic: ${topic}`);
+      this._consumer.resume([{ topic }]);
+      this._resumeTimeout = null;
     }, timeout);
   };
-
-  const isPaused = (topic) => {
-    return Boolean(consumer.paused().find(({ topic: _topic }) => _topic === topic));
-  };
-
-  await consumer.run({
-    autoCommit: false,
-    eachBatch: async ({ batch, isRunning, isStale, resolveOffset, heartbeat }) => {
-      for (const message of batch.messages) {
-        if (!isRunning() || isStale()) break;
-
-        if (batch.topic === HIGH_PRIORITY_TOPIC && !isPaused(LOW_PRIORITY_TOPIC)) {
-          pauseTopic(LOW_PRIORITY_TOPIC);
-          setResumeTopicTimeout(LOW_PRIORITY_TOPIC, 5_000);
-        }
-
-        await processMessage(message, batch.topic);
-        resolveOffset(message.offset);
-
-        const { topic, partition } = batch;
-
-        const offset = {
-          topic,
-          partition,
-          offset: (Number(message.offset) + 1).toString(),
-        };
-
-        await consumer.commitOffsets([offset]);
-        await heartbeat();
-      }
-    },
-  });
-
-  console.log('\nConsumer Started! 🚀\n');
 }
 
-init();
+const processMessage = async (batchCounter, topic, { key, offset, value }) => {
+  const message = [
+    `[${new Date().toISOString()}] 💬 New Message - topic: ${topic}`,
+    `batch: ${batchCounter}`,
+    `key: ${key}`,
+    `offset: ${offset}`,
+    `value: ${value.toString()}`,
+  ];
 
-const shutdown = async () => {
-  console.log('\nGracefully Shutting Down 😴...\n');
-  await consumer.disconnect();
-  process.exit(0);
+  console.log(`${message.join(', ')}\n`);
 };
 
-process
-  .on('SIGTERM', shutdown)
-  .on('SIGINT', shutdown)
-  .on('SIGHUP', shutdown)
-  .on('uncaughtException', (err) => {
-    firstReader.disconnect();
-    console.error('uncaughtException caught the error: %o ', err);
-    process.exit(1);
-  });
+const topics = [HIGH_PRIORITY_TOPIC, LOW_PRIORITY_TOPIC];
+const reader = new Reader(topics, processMessage);
+
+reader.start();

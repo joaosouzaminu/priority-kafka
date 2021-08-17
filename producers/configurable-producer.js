@@ -1,4 +1,4 @@
-const { Kafka } = require('kafkajs');
+const { Kafka, } = require('kafkajs');
 const { delay } = require('../utils/delay');
 
 const kafka = new Kafka({
@@ -24,6 +24,7 @@ async function init() {
   };
 
   const messagesToSend = process.argv[2] || 1;
+  const
 
   for (let i = 0; i < messagesToSend; i++) {
     await sendHigh();

@@ -20,11 +20,17 @@ stopSignals.forEach((signal) => process.on(signal, shutdown));
 
 async function init() {
   await producer.connect();
+  const topic = process.argv[2];
+
+  if (!topic) {
+    console.log('Informe um tópico!');
+    process.exit(1);
+  }
 
   const sendLow = async () => {
     const response = await producer.send({
-      topic: 'low-priority',
-      messages: [{ value: 'low' }],
+      topic: topic,
+      messages: [{ value: `${topic} - message` }],
     });
 
     const [{ baseOffset: offset }] = response;
